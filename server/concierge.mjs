@@ -227,6 +227,10 @@ function openLocation(value) {
   const match = /^anywhere(?:\s+except\s+(.+))?$/i.exec(String(value || '').trim())
   return match ? { except: match[1] ? match[1].split(/\s*(?:,|\band\b)\s*/i).map(city => city.trim()).filter(Boolean) : [] } : null
 }
+// The user handing the choice over entirely ("surprise me", "you pick"); also counts as keeping an open location.
+const SURPRISE = /\b(surprise me|pick for me|choose for me|you (pick|choose|decide)|dealer'?s choice)\b/i
+// Sent to the model when a changed request needs the open location reconfirmed (see locationRecheck in chat()).
+const RECHECK_INSTRUCTION = 'The user changed their request after an earlier "anywhere" / "surprise me" answer. Do not search or recommend this turn. Acknowledge the new request in one short sentence, then ask exactly one question offering three choices: still fine going anywhere, still want to be surprised, or an area they have in mind. Use the words "anywhere" and "surprise" in the question. Return recommendation_id null and empty alternatives.'
 function openLocationValue(except) { return except.length ? `Anywhere except ${except.join(', ')}` : 'Anywhere' }
 // Catalog cities the message rules out ("she doesn't wanna go to Santa Ana", "not Irvine").
 function ruledOutCities(message, cities) {
@@ -506,6 +510,13 @@ export async function chat({ message, context = [], history = [], locationPrompt
   const isOpeningTurn = !recentHistory.some(item => item.role === 'user')
   const lastAssistant = [...recentHistory].reverse().find(item => item.role === 'assistant')
   const hasCity = () => current.some(item => item.key === 'city' && item.value?.trim())
+  // Location recheck: "anywhere" / "surprise me" from an earlier turn was agreed for the request as it was then.
+  // If the user now changes what they want without restating that, ask once before searching anywhere again.
+  // The confirmation question itself is recognized by naming "anywhere" or "surprise", so its answer goes straight to search.
+  const openAtStart = !!openLocation(current.find(item => item.kind === 'tonight' && item.key === 'city')?.value)
+  const answeringRecheck = /\?/.test(lastAssistant?.text || '') && /\b(anywhere|surprise|area in mind)\b/i.test(lastAssistant?.text || '')
+  const restatesOpen = OPEN_LOCATION.test(message) || SURPRISE.test(message)
+  let locationRecheck = false
 
   // --- Location gate: after three unanswered location questions, offer the catalog's cities instead ---
   const priorLocationPrompts = Math.max(0, Math.min(Number(locationPromptCount) || 0, 3))
@@ -571,7 +582,7 @@ export async function chat({ message, context = [], history = [], locationPrompt
       // 3. The reply asks a question mid-conversation while a confirmed city exists and no search ran this turn.
       const reply = String(final.reply || '')
       const namedWithoutCard = !record && [...records.values()].some(item => !priorRecommendationIds.has(item.id) && reply.toLowerCase().includes(item.name.toLowerCase()))
-      const askedInsteadOfSearching = !record && !isOpeningTurn && hasCity() && !events.some(item => item.tool === 'search_restaurants') && /\?\s*$/.test(reply.trim())
+      const askedInsteadOfSearching = !record && !isOpeningTurn && hasCity() && !locationRecheck && !events.some(item => item.tool === 'search_restaurants') && /\?\s*$/.test(reply.trim())
       if (!corrected && canRetry && (namedWithoutCard || askedInsteadOfSearching)) {
         corrected = true
         messages.push({ role: 'user', content: namedWithoutCard ? `Correction: your reply names a restaurant returned by a tool but recommendation_id is null. Set recommendation_id (and alternatives) to the IDs you describe: ${[...records.keys()].join(', ')}. Return the same JSON shape.` : 'Correction: the city is confirmed. Do not ask about cuisine, price, or vibe. Search that city now with only the hard requirements in context and recommend; ask a question only if the search returns no candidates. Return the same JSON shape.' })
@@ -662,9 +673,24 @@ export async function chat({ message, context = [], history = [], locationPrompt
           current = result.next
           output = unconfirmed.length ? { ...result, not_saved: unconfirmed, reason: 'The user has not confirmed this location in this conversation. Ask them to confirm it.' } : result
           result.changes.forEach(change => events.push(event('update_context', 'complete', `Updated ${change.field}`, args, null, change)))
+          // A changed requirement (anything but the city) while the city is still an earlier open location triggers the recheck.
+          // If this update dropped the open city (e.g. new_outing) without naming a real one, it is restored so the user's
+          // answer to the recheck ("still anywhere", "surprise me") can search right away.
+          const cityNow = current.find(item => item.key === 'city')?.value
+          if (openAtStart && !answeringRecheck && !restatesOpen && (!cityNow || openLocation(cityNow)) && result.changes.some(change => change.field !== label.city)) {
+            if (!cityNow) current = [...current, { ...context.find(item => item.kind === 'tonight' && contextKey(item.key) === 'city'), key: 'city', label: label.city, kind: 'tonight' }]
+            locationRecheck = true
+            output = { ...output, location_check: RECHECK_INSTRUCTION }
+          }
         } else if (call.function.name === 'search_restaurants') {
           // Hard location gate: never search without a confirmed city in context.
           const city = current.find(item => item.key === 'city' && item.value?.trim())?.value
+          if (locationRecheck) {
+            output = { status: 'location_check_required', instruction: RECHECK_INSTRUCTION }
+            events.push(event('search_restaurants', 'complete', 'Checking location first', args, output))
+            messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(output) })
+            continue
+          }
           if (!city) {
             output = { status: 'location_required' }
             events.push(event('search_restaurants', 'complete', 'Waiting for location', args, output))
