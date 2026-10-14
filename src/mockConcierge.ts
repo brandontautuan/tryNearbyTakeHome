@@ -4,7 +4,7 @@ export type Detail = { key: string; label: string; value: string; kind: 'saved' 
 export type Recommendation = { restaurantId: number; name: string; cuisine: string; price: string; address: string; hours: string; why: string; caveat: string }
 export type Activity = { id: string; tool: string; status: 'complete' | 'working' | 'error'; summary: string; input?: string; result?: string; change?: { field: string; from: string; to: string } }
 export type ConciergeResponse = { reply: string; recommendation?: Recommendation; alternatives?: Recommendation[]; context: Detail[]; activity: Activity[]; noMatches?: boolean; locationState?: 'asked' | 'resolved' | 'exhausted' }
-export type HistoryItem = { role: 'user' | 'assistant'; text: string; recommendation?: Recommendation }
+export type HistoryItem = { role: 'user' | 'assistant'; text: string; recommendation?: Recommendation; alternatives?: Recommendation[] }
 
 const defaultContext: Detail[] = []
 const indian: Recommendation = {
@@ -25,10 +25,10 @@ function merge(context: Detail[], changes: Partial<Record<string, string>>) {
   return next
 }
 
-export async function askConcierge(message: string, context: Detail[], history: HistoryItem[], locationPromptCount: number): Promise<ConciergeResponse> {
+export async function askConcierge(message: string, context: Detail[], history: HistoryItem[], locationPromptCount: number, lastCity?: string): Promise<ConciergeResponse> {
   const response = await fetch('/api/chat', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, context, history, locationPromptCount })
+    body: JSON.stringify({ message, context, history, locationPromptCount, lastCity })
   })
   const data = await response.json() as ConciergeResponse & { error?: string }
   if (!response.ok) throw new Error(data.error || 'The concierge is unavailable.')
