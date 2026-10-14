@@ -11,6 +11,12 @@ dist/
 # Supabase local development files
 supabase/.temp/
 
+# Local agent skills and tooling state
+.agents/
+.claude/
+.impeccable/
+skills-lock.json
+
 # Editor and operating-system files
 .DS_Store
 .vscode/

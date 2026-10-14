@@ -1,12 +1,14 @@
-// Replace this module with a call to your Supabase Edge Function / API when ready.
+// The local Vite middleware exposes POST /api/chat. Move this transport to a
+// trusted server/Edge Function for deployment; it must never run in the browser.
 export type Detail = { key: string; label: string; value: string; kind: 'saved' | 'tonight' }
-export type Recommendation = { name: string; cuisine: string; price: string; address: string; hours: string; why: string; caveat: string }
+export type Recommendation = { restaurantId: number; name: string; cuisine: string; price: string; address: string; hours: string; why: string; caveat: string }
 export type Activity = { id: string; tool: string; status: 'complete' | 'working' | 'error'; summary: string; input?: string; result?: string; change?: { field: string; from: string; to: string } }
-export type ConciergeResponse = { reply: string; recommendation?: Recommendation; context: Detail[]; activity: Activity[]; noMatches?: boolean }
+export type ConciergeResponse = { reply: string; recommendation?: Recommendation; alternatives?: Recommendation[]; context: Detail[]; activity: Activity[]; noMatches?: boolean; locationState?: 'asked' | 'resolved' | 'exhausted' }
+export type HistoryItem = { role: 'user' | 'assistant'; text: string; recommendation?: Recommendation }
 
 const defaultContext: Detail[] = []
 const indian: Recommendation = {
-  name: 'Mock restaurant — replace with restaurants.txt data', cuisine: 'Indian', price: 'Price band from source',
+  restaurantId: 0, name: 'Mock restaurant — replace with restaurants.txt data', cuisine: 'Indian', price: 'Price band from source',
   address: 'Address from supplied data', hours: 'Hours from supplied data',
   why: 'This example card is ready to display a match returned by your restaurant source.',
   caveat: 'Please load restaurants.txt to show verified dietary notes and seating caveats.'
@@ -23,7 +25,15 @@ function merge(context: Detail[], changes: Partial<Record<string, string>>) {
   return next
 }
 
-export async function askConcierge(message: string, context: Detail[]): Promise<ConciergeResponse> {
+export async function askConcierge(message: string, context: Detail[], history: HistoryItem[], locationPromptCount: number): Promise<ConciergeResponse> {
+  const response = await fetch('/api/chat', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, context, history, locationPromptCount })
+  })
+  const data = await response.json() as ConciergeResponse & { error?: string }
+  if (!response.ok) throw new Error(data.error || 'The concierge is unavailable.')
+  return data
+  /* Mock fixture retained below as a fallback reference for offline UI work.
   await new Promise(r => setTimeout(r, 750))
   const text = message.toLowerCase()
   if (text.includes('fail')) throw new Error('The simulated concierge is taking a moment. Please try again.')
@@ -43,6 +53,6 @@ export async function askConcierge(message: string, context: Detail[]): Promise<
     const next = merge(context, { vibe: 'Quiet', group: '2 people' })
     return { reply: 'A quiet date spot it is. I’ve adjusted the search to favor a calmer atmosphere.', recommendation: quiet, context: next, activity: [{ id: crypto.randomUUID(), tool: 'update_context', status: 'complete', summary: 'Updated tonight’s atmosphere', change: { field: 'Atmosphere', from: context.find(x => x.key === 'vibe')?.value || '—', to: 'Quiet' } }, { id: crypto.randomUUID(), tool: 'search_restaurants', status: 'complete', summary: 'Refined recommendation', input: 'quiet dinner for 2', result: '1 mock display result' }] }
   }
-  return { reply: 'A little more detail will help me narrow it down. What matters most tonight: neighborhood, budget, dietary needs, or atmosphere?', context, activity: [{ id: crypto.randomUUID(), tool: 'clarify_request', status: 'complete', summary: 'Asked a follow-up question' }] }
+  return { reply: 'A little more detail will help me narrow it down. What matters most tonight: neighborhood, budget, dietary needs, or atmosphere?', context, activity: [{ id: crypto.randomUUID(), tool: 'clarify_request', status: 'complete', summary: 'Asked a follow-up question' }] } */
 }
 export { defaultContext }

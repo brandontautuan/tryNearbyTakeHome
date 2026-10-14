@@ -11,23 +11,13 @@ npm run dev
 
 ## Supabase
 
-```bash
-supabase login
-supabase init
-supabase link --project-ref YOUR_PROJECT_REF
-supabase db push
-```
-
-The initial schema is in `supabase/migrations/`. Seed the supplied 50 restaurant records into `restaurants` before enabling the live agent. The catalog source is not included in this repository, so no fabricated seed data is committed.
+This app uses the connected Supabase project managed in the Supabase Dashboard. Its schema and restaurant catalog are already configured there.
 
 All database access belongs in trusted server routes or Edge Functions. Do not expose a Supabase service-role key in this Vite app. `.env.local` is ignored by Git; `.env.example` is the safe template.
 
 ## Delivery artifacts
 
-- `restaurant-agent-design.md` — product and engineering design
-- `agent-prompt.md` — exported agent instructions
-- `architecture.md` — deployment and data-flow diagram
-- `supabase/migrations/` — Supabase database schema
+- `restaurant-agent-design.md` — product and engineering design, agent prompt, and architecture diagram
 
 ## Live API contract
 

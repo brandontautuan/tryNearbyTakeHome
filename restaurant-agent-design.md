@@ -184,7 +184,7 @@ Manual acceptance scenarios: vague opening; complete opening; fragments and off-
 
 ## 11. Implementation and five-hour budget
 
-Suggested default: TypeScript web app with frontend and backend routes in one deployment, Supabase Postgres, and OpenRouter accessed through the OpenAI JavaScript SDK. Implement tool calling with the explicit backend loop described above; do not add an agent framework. Keep the provider configuration isolated to the backend and export the prompt as agent-prompt.md.
+Suggested default: TypeScript web app with frontend and backend routes in one deployment, Supabase Postgres, and OpenRouter accessed through the OpenAI JavaScript SDK. Implement tool calling with the explicit backend loop described above; do not add an agent framework. Keep the provider configuration isolated to the backend; the agent prompt is included below.
 
 | Budget | Work |
 | --- | --- |
@@ -201,3 +201,36 @@ Deploy a minimal working version early. If time is tight, defer context editing 
 A reviewer can open the deployed app, converse naturally, change a preference, get a grounded restaurant recommendation, refresh without losing the conversation, and inspect the tool results and context updates that produced it. The repository, live URL, exported prompt, and architecture diagram are ready for submission.
 
 Source brief: A Really Fun Project.pdf. Source catalog: restaurants.txt. This document specifies proposed behavior; it does not claim that implementation or deployment is complete.
+
+## Appendix A: Agent prompt
+
+You are a restaurant concierge helping someone choose from the supplied restaurant catalog.
+
+- Ask one useful question only when it can materially change the recommendation. Otherwise search.
+- Treat explicit requirements as hard constraints. Never silently relax dietary requirements, budget limits, or location constraints.
+- Keep durable preferences separate from the current outing. A companion’s needs and a request such as “somewhere quiet tonight” are outing context. A direct statement such as “I’m vegan” can be saved as a durable preference.
+- Use `update_context` for every context change, preserving whether it is explicit or inferred and the source message. Use `search_restaurants` before recommending and `get_restaurant_details` for a selected restaurant when needed.
+- Recommend one primary restaurant, with an optional backup. Only reference restaurants returned by tools.
+- Include the supplied cuisine, price band, address, listed hours, reasons it fits, and relevant caveats. Do not invent prices, ratings, photos, wait times, reservation availability, live hours, or allergy safety.
+- Dietary options that require modifications or advance notice are caveats, not confirmed same-night matches.
+- If nothing satisfies hard constraints, explain the conflict and ask which single constraint the user would like to change.
+- Never reveal chain-of-thought. The visible activity log contains only actual tool calls, results, errors, and context diffs.
+
+## Appendix B: Architecture diagram
+
+```mermaid
+flowchart LR
+  B[Browser] -->|anonymous HttpOnly session cookie| API[Trusted chat API]
+  API -->|load and persist| DB[(Supabase Postgres)]
+  API -->|bounded tool loop| LLM[OpenRouter via OpenAI SDK]
+  LLM -->|update_context\nsearch_restaurants\nget_restaurant_details| API
+  API -->|reply, context, events| B
+
+  DB --- S[sessions]
+  DB --- C[conversations]
+  DB --- M[messages]
+  DB --- R[restaurants]
+  DB --- E[agent_events]
+```
+
+The browser never queries the database with a service credential. The trusted API validates the anonymous session, owns tool execution, and records the user-visible execution trace.
