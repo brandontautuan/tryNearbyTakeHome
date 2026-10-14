@@ -2,6 +2,9 @@ import { FormEvent, useEffect, useRef, useState } from 'react'
 import { ArrowUp, ChevronLeft, ChevronRight, CircleAlert, Download, LoaderCircle, MessageSquarePlus, Pencil, RotateCcw, Sparkles, Trash2, X } from 'lucide-react'
 import { Activity, askConcierge, ConciergeResponse, defaultContext, Detail, HistoryItem, Recommendation } from './mockConcierge'
 
+// The chat UI. All agent work happens on the server (server/concierge.mjs); this file holds the
+// conversation, context, and activity log in state and mirrors them to localStorage.
+
 type Message = { id: string; role: 'user' | 'assistant'; text: string; recommendation?: Recommendation; alternatives?: Recommendation[]; noMatches?: boolean }
 type Stored = { messages: Message[]; context: Detail[]; activity: Activity[]; locationPromptCount?: number }
 const intros = [
@@ -26,6 +29,7 @@ function starter(): Message[] {
   localStorage.setItem('nearby-last-intro', text)
   return [{ id: 'hello', role: 'assistant', text }]
 }
+// Loads the saved conversation, tolerating missing fields; a corrupt entry is discarded.
 function restoreConversation(): Stored | null {
   try {
     const raw = localStorage.getItem('nearby-concierge')
@@ -47,6 +51,7 @@ function downloadStoredLogs() { const payload = { exported_at: new Date().toISOS
 function clearStoredLogs() { const state = storedConversation(); localStorage.setItem('nearby-concierge', JSON.stringify({ ...state, activity: [] })); window.location.reload() }
 const examples = ['Cheap dinner in Irvine', 'A quiet date spot', 'Dinner with a vegan friend']
 
+// "What I know": saved preferences and tonight's plans, each editable and removable.
 function ContextPanel({ context, onDelete, onEdit, onForget, onClearPlan }: { context: Detail[], onDelete: (key: string) => void, onEdit: (detail: Detail) => void, onForget: () => void, onClearPlan: () => void }) {
   return <aside className="side-card context-card"><div className="panel-heading"><div><p className="eyebrow">YOUR PREFERENCES</p><h2>What I know</h2></div><Sparkles size={18} /></div><p className="muted">You’re always in control of what I remember.</p>{(['saved', 'tonight'] as const).map(kind => <section className="context-group" key={kind}><h3>{kind === 'saved' ? 'Saved preferences' : 'Tonight’s plans'}</h3>{context.filter(x => x.kind === kind).length ? context.filter(x => x.kind === kind).map(detail => <div className="detail" key={detail.key}><span><b>{detail.label}</b><em>{detail.value}</em></span><button onClick={() => onEdit(detail)} aria-label={`Edit ${detail.label}`}><Pencil size={14}/></button><button onClick={() => onDelete(detail.key)} aria-label={`Remove ${detail.label}`}><X size={15}/></button></div>) : <p className="empty">Nothing captured yet.</p>}</section>)}{context.some(detail => detail.kind === 'tonight') && <button className="forget" onClick={onClearPlan} title="Starts a fresh conversation and keeps saved preferences">Clear this meal plan</button>}{context.some(detail => detail.kind === 'saved') && <button className="forget" onClick={onForget}>Forget saved preferences</button>}</aside>
 }
@@ -63,17 +68,20 @@ function describe(event: Activity): { title: string; detail: string; tags: strin
     const names: string[] = Array.isArray(result) ? result.map(item => item?.name).filter(Boolean) : []
     const excluded = Array.isArray(input?.exclude_restaurant_ids) ? input.exclude_restaurant_ids.length : 0
     const tags = [input?.cuisine, priceRange(input?.min_price_level, input?.max_price_level), input?.keyword && `“${input.keyword}”`, excluded && `skipping ${excluded} shown`].filter((tag, i, all) => tag && all.findIndex(other => String(other).replace(/[“”]/g, '').toLowerCase() === String(tag).replace(/[“”]/g, '').toLowerCase()) === i) as string[]
-    const detail = event.status === 'error' ? 'Search unavailable' : /location/i.test(event.summary) ? 'Waiting for a city' : names.length ? `${names.length} ${names.length === 1 ? 'match' : 'matches'}` : 'No matches'
+    const count = `${names.length} ${names.length === 1 ? 'match' : 'matches'}`
+    const detail = event.outcome === 'fallback' ? `${count} from recent results · live search down` : event.status === 'error' ? (event.outcome === 'unavailable' || /unavailable/i.test(event.summary) ? 'Search unavailable' : event.summary) : /location/i.test(event.summary) ? 'Waiting for a city' : names.length ? `${names.length} ${names.length === 1 ? 'match' : 'matches'}` : 'No matches'
     return { title: input?.city ? `Searched ${input.city}` : 'Searched restaurants', detail, tags, names }
   }
   if (event.tool === 'get_restaurant_details') return Array.isArray(result) ? { title: 'Recalled earlier picks', detail: result.map(item => item?.name).filter(Boolean).join(', '), tags: [], names: [] } : { title: 'Checked details', detail: result?.name || event.summary, tags: [], names: [] }
   return { title: event.tool.replaceAll('_', ' '), detail: event.summary, tags: [], names: [] }
 }
+// The six most recent agent steps; rows with tags, names, or a previous value expand.
 function ActivityPanel({ activity, onClear = clearStoredLogs, onDownload = downloadStoredLogs }: { activity: Activity[], onClear?: () => void, onDownload?: () => void }) {
   const [open, setOpen] = useState<string | null>(null)
-  return <aside className="side-card activity-card"><div className="panel-heading"><h2>Agent activity</h2><span className="simulated">Live</span></div>{activity.length ? <><ol className="events">{activity.slice(0, 6).map(event => { const d = describe(event), expandable = d.tags.length > 0 || d.names.length > 0 || !!d.was, isOpen = open === event.id; const row = <><span className={`dot dot-${event.status}`}/><span><b>{d.title}</b><em>{d.detail}</em></span>{expandable && <ChevronRight className={isOpen ? 'turned' : ''} size={15}/>}</>; return <li className="event" key={event.id}>{expandable ? <button className="event-row" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : event.id)}>{row}</button> : <div className="event-row">{row}</div>}{isOpen && <div className="event-detail">{d.was && <p>Was <s>{d.was}</s></p>}{d.tags.length > 0 && <span className="event-tags">{d.tags.map(tag => <i key={tag}>{tag}</i>)}</span>}{d.names.length > 0 && <ul>{d.names.map(name => <li key={name}>{name}</li>)}</ul>}</div>}</li> })}</ol><div className="activity-actions"><button onClick={onDownload}><Download size={14}/> Download logs</button><button onClick={() => { setOpen(null); onClear() }}><Trash2 size={14}/> Clear logs</button></div></> : <p className="empty">Each step I take will show up here.</p>}</aside>
+  return <aside className="side-card activity-card"><div className="panel-heading"><h2>Agent activity</h2><span className="simulated">Live</span></div>{activity.length ? <><ol className="events">{activity.slice(0, 6).map(event => { const d = describe(event), expandable = d.tags.length > 0 || d.names.length > 0 || !!d.was, isOpen = open === event.id; const row = <><span className={`dot dot-${event.outcome === 'fallback' ? 'working' : event.status}`}/><span><b>{d.title}</b><em>{d.detail}</em></span>{expandable && <ChevronRight className={isOpen ? 'turned' : ''} size={15}/>}</>; return <li className="event" key={event.id}>{expandable ? <button className="event-row" aria-expanded={isOpen} onClick={() => setOpen(isOpen ? null : event.id)}>{row}</button> : <div className="event-row">{row}</div>}{isOpen && <div className="event-detail">{d.was && <p>Was <s>{d.was}</s></p>}{d.tags.length > 0 && <span className="event-tags">{d.tags.map(tag => <i key={tag}>{tag}</i>)}</span>}{d.names.length > 0 && <ul>{d.names.map(name => <li key={name}>{name}</li>)}</ul>}</div>}</li> })}</ol><div className="activity-actions"><button onClick={onDownload}><Download size={14}/> Download logs</button><button onClick={() => { setOpen(null); onClear() }}><Trash2 size={14}/> Clear logs</button></div></> : <p className="empty">Each step I take will show up here.</p>}</aside>
 }
-function RestaurantCard({ item }: { item: Recommendation }) { return <article className="restaurant"><div className="restaurant-top"><div><p className="eyebrow">RECOMMENDATION</p><h3>{item.name}</h3><span className="tags"><i>{item.cuisine}</i><i>{item.price}</i></span></div><span className="pin">✦</span></div><div className="meta"><p><b>Address</b>{item.address}</p><p><b>Listed hours</b>{item.hours}</p></div><p className="why">{item.why}</p><p className="caveat"><CircleAlert size={15}/> {item.caveat}</p></article> }
+function RestaurantCard({ item }: { item: Recommendation }) { return <article className="restaurant"><div className="restaurant-top"><div><p className="eyebrow">RECOMMENDATION</p><h3>{item.name}</h3><span className="tags"><i>{item.cuisine}</i><i>{item.price}</i></span></div><span className="pin">✦</span></div><div className="meta"><p><b>Address</b>{item.address}</p><p><b>Listed hours</b>{item.hours}</p></div><p className="why">{item.why}</p>{item.warning && <p className="caveat warning"><CircleAlert size={15}/> {item.warning}</p>}<p className="caveat"><CircleAlert size={15}/> {item.caveat}</p></article> }
+// The primary recommendation plus alternatives; swipe or use the arrows. A single card renders without the carousel.
 function RecommendationCarousel({ items }: { items: Recommendation[] }) {
   const [index, setIndex] = useState(0), touchX = useRef<number | null>(null)
   if (items.length < 2) return <RestaurantCard item={items[0]}/>
@@ -88,10 +96,43 @@ export default function App() {
   const [locationPromptCount, setLocationPromptCount] = useState(() => restored?.locationPromptCount || 0)
   const [greeting, setGreeting] = useState(0), [typing, setTyping] = useState(true)
   const end = useRef<HTMLDivElement>(null)
+  // Show a brief typing indicator before each new greeting.
   useEffect(() => { setTyping(true); const t = setTimeout(() => setTyping(false), 1300); return () => clearTimeout(t) }, [greeting])
+  // Persist the whole conversation so a reload picks up where it left off.
   useEffect(() => { localStorage.setItem('nearby-concierge', JSON.stringify({ messages, context, activity, locationPromptCount })) }, [messages, context, activity, locationPromptCount])
-  useEffect(() => end.current?.scrollIntoView({ behavior: 'smooth' }), [messages, loading, error])
-  async function send(value = draft) { const text = value.trim(); if (!text || loading) return; setDraft(''); setError(null); setLastMessage(text); const history: HistoryItem[] = messages.slice(-12).map(({ role, text, recommendation, alternatives }) => ({ role, text, recommendation, alternatives })); setMessages(m => [...m, { id: crypto.randomUUID(), role: 'user', text }]); setLoading(true); try { const response: ConciergeResponse = await askConcierge(text, context, history, locationPromptCount, localStorage.getItem('nearby-last-city') || undefined, new Date().toLocaleString('en-US', { weekday: 'long', hour: 'numeric', minute: '2-digit' })); setMessages(m => [...m, { id: crypto.randomUUID(), role: 'assistant', text: response.reply, recommendation: response.recommendation, alternatives: response.alternatives, noMatches: response.noMatches }]); setContext(response.context); const confirmedCity = response.context.find(detail => detail.key === 'city')?.value; if (confirmedCity) localStorage.setItem('nearby-last-city', confirmedCity); setActivity(a => [...[...response.activity].reverse(), ...a]); if (response.locationState === 'resolved') setLocationPromptCount(0); else if (response.locationState === 'asked') setLocationPromptCount(count => Math.min(count + 1, 3)); else if (response.locationState === 'exhausted') setLocationPromptCount(3) } catch (e) { setError(e instanceof Error ? e.message : 'Something went wrong.') } finally { setLoading(false) } }
+  useEffect(() => { end.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, loading, error])
+  // One user turn: POST to /api/chat, then fold the response back into state.
+  async function send(value = draft) {
+    const text = value.trim()
+    if (!text || loading) return
+    setDraft(''); setError(null); setLastMessage(text)
+    // History is the conversation before this message; the server trims it again.
+    const history: HistoryItem[] = messages.slice(-12).map(({ role, text, recommendation, alternatives }) => ({ role, text, recommendation, alternatives }))
+    setMessages(m => [...m, { id: crypto.randomUUID(), role: 'user', text }])
+    setLoading(true)
+    try {
+      const lastCity = localStorage.getItem('nearby-last-city') || undefined
+      const localTime = new Date().toLocaleString('en-US', { weekday: 'long', hour: 'numeric', minute: '2-digit' })
+      const response: ConciergeResponse = await askConcierge(text, context, history, locationPromptCount, lastCity, localTime)
+      setMessages(m => [...m, { id: crypto.randomUUID(), role: 'assistant', text: response.reply, recommendation: response.recommendation, alternatives: response.alternatives, noMatches: response.noMatches }])
+      // The server returns the full updated context; it replaces ours.
+      setContext(response.context)
+      // Remember the confirmed city so the next outing can offer "Still eating in …?".
+      const confirmedCity = response.context.find(detail => detail.key === 'city')?.value
+      if (confirmedCity) localStorage.setItem('nearby-last-city', confirmedCity)
+      // Newest first.
+      setActivity(a => [...[...response.activity].reverse(), ...a])
+      // Location prompt counter: reset once a city is known, count each unanswered ask, stop at 3.
+      if (response.locationState === 'resolved') setLocationPromptCount(0)
+      else if (response.locationState === 'asked') setLocationPromptCount(count => Math.min(count + 1, 3))
+      else if (response.locationState === 'exhausted') setLocationPromptCount(3)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Something went wrong.')
+    } finally {
+      setLoading(false)
+    }
+  }
+  // "New outing": a fresh chat that keeps saved preferences but drops tonight's plans.
   function newConversation() { setMessages(starter()); setContext(c => c.filter(x => x.kind === 'saved')); setActivity([]); setLocationPromptCount(0); setError(null); setDraft(''); setGreeting(g => g + 1) }
   function forgetSavedPreferences() { setContext(c => c.filter(detail => detail.kind !== 'saved')) }
   function edit(detail: Detail) { const value = window.prompt(`Update ${detail.label}`, detail.value); if (value?.trim()) setContext(c => c.map(d => d.key === detail.key ? { ...d, value: value.trim() } : d)) }

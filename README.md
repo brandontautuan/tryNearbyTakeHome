@@ -17,7 +17,7 @@ All database access belongs in trusted server routes or Edge Functions. Do not e
 
 ## Delivery artifacts
 
-- `restaurant-agent-design.md` — product and engineering design, agent prompt, and architecture diagram
+- `docs/restaurant-agent-design.md` — product and engineering design, agent prompt, and architecture diagram
 
 ## Live API contract
 

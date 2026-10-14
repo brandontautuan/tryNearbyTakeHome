@@ -4,9 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "dev": "vite web",
+    "build": "tsc -p web && vite build web",
+    "preview": "vite preview web"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

@@ -18,3 +18,4 @@
 .dot-error{background:#d26c5a}.dot-working{background:#d8a24a}
 .forget+.forget{margin-top:8px}
 .activity-actions{display:flex;gap:8px;margin-top:14px}.activity-actions button{flex:1;border:1px solid #e5d7ca;border-radius:8px;background:#fffaf5;color:#75685b;padding:8px 6px;font-size:10px;font-weight:600;display:flex;align-items:center;justify-content:center;gap:5px}.activity-actions button:hover{border-color:#d27658;color:#a45036}
+.caveat.warning{background:#fbe9e3;color:#934633;margin-bottom:6px}
