@@ -1,5 +1,5 @@
-// The local Vite middleware exposes POST /api/chat. Move this transport to a
-// trusted server/Edge Function for deployment; it must never run in the browser.
+// POST /api/chat is served by the Vite middleware locally and by api/chat.js on Vercel.
+// The concierge runs server-side only; it must never run in the browser.
 export type Detail = { key: string; label: string; value: string; kind: 'saved' | 'tonight' }
 export type Recommendation = { restaurantId: number; name: string; cuisine: string; price: string; address: string; hours: string; why: string; caveat: string }
 export type Activity = { id: string; tool: string; status: 'complete' | 'working' | 'error'; summary: string; input?: string; result?: string; change?: { field: string; from: string; to: string } }

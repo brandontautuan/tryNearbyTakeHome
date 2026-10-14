@@ -2,8 +2,10 @@ import OpenAI from 'openai'
 import { createClient } from '@supabase/supabase-js'
 import { readFileSync } from 'node:fs'
 
+// Locally, values come from .env; on Vercel there is no .env and they come from project environment variables.
 function environment() {
-  const file = readFileSync(new URL('../.env', import.meta.url), 'utf8')
+  let file = ''
+  try { file = readFileSync(new URL('../.env', import.meta.url), 'utf8') } catch {}
   return { ...Object.fromEntries(file.split(/\r?\n/).filter(x => /^[A-Z][A-Z0-9_]*=/.test(x)).map(x => [x.slice(0, x.indexOf('=')), x.slice(x.indexOf('=') + 1)])), ...process.env }
 }
 const env = environment()
