@@ -236,7 +236,9 @@ function openLocationValue(except) { return except.length ? `Anywhere except ${e
 function ruledOutCities(message, cities) {
   const lower = message.toLowerCase()
   return cities.filter(city => {
-    const needle = city.toLowerCase()
+    const needle = city.trim().toLowerCase()
+    // An empty needle matches at every index without advancing, which would loop forever (the model sends city: "" to clear it).
+    if (!needle) return false
     for (let index = lower.indexOf(needle); index !== -1; index = lower.indexOf(needle, index + needle.length)) {
       if (/\b(not|no|don'?t|doesn'?t|dont|doesnt|never|avoid|except|other than|besides|but)\b[\s\w']{0,25}$/.test(lower.slice(Math.max(0, index - 40), index))) return true
     }
@@ -329,6 +331,8 @@ function applyFilters(query, { min_price_level, max_price_level, cuisine, keywor
 }
 // Explains an empty search by re-running it with each filter dropped, so the
 // agent can name the blocking requirement and offer real catalog alternatives.
+// The independent checks run together: on a slow production connection this avoids
+// adding one database round-trip for every requested filter.
 async function emptyResultDiagnostic(city, filters) {
   const open = openLocation(city)
   // How the summary names the searched area.
@@ -346,13 +350,17 @@ async function emptyResultDiagnostic(city, filters) {
   const used = ['cuisine', 'keyword', 'price'].filter(k => k === 'price'
     ? Number.isInteger(filters.min_price_level) || Number.isInteger(filters.max_price_level)
     : typeof filters[k] === 'string' && filters[k].trim())
-  const matchesIfDropped = {}
-  for (const k of used) {
+  const relaxedChecks = used.map(async k => {
     const relaxed = k === 'price' ? { ...filters, min_price_level: undefined, max_price_level: undefined } : { ...filters, [k]: undefined }
-    matchesIfDropped[k] = (await rows(relaxed))?.length ?? null
-  }
+    return [k, (await rows(relaxed))?.length ?? null]
+  })
   // An open search already covered every allowed city, so there are no "other cities" to suggest.
-  const otherCities = open ? [] : [...new Set(((await rows(filters, false)) || []).map(item => item.city))].filter(item => item.toLowerCase() !== city.toLowerCase()).sort()
+  const [relaxedResults, otherRows] = await Promise.all([
+    Promise.all(relaxedChecks),
+    open ? Promise.resolve([]) : rows(filters, false)
+  ])
+  const matchesIfDropped = Object.fromEntries(relaxedResults)
+  const otherCities = open ? [] : [...new Set((otherRows || []).map(item => item.city))].filter(item => item.toLowerCase() !== city.toLowerCase()).sort()
   const blocking = used.find(k => matchesIfDropped[k] > 0) || (otherCities.length ? 'city' : 'refine_preferences')
   const summary = [
     `0 restaurants in ${where} match every requested filter.`,
@@ -678,7 +686,7 @@ async function backfillRecommendationIds(history) {
 // delegation/location, location wording, outings/hours, then the user turn.
 function buildMessages({ message, current, recentHistory, priorRecommendationIds, coverageCities, isOpeningTurn, previousCity, userTime }) {
   return [
-    { role: 'system', content: `You are a concise, warm restaurant concierge. Your FIRST action on every turn must be update_context: extract explicit preferences or plans from the user's message, preserve unrelated context, and use an empty update when there is nothing to change. Saved preferences are durable statements about the user (for example, “I’m vegan”). Tonight plans include city, budget, time, companions, group size, and occasion. LOCATION GATE: after update_context, do not call search_restaurants unless its resulting context contains a city. With a city, search that exact city only. This catalog has no coordinates, so never claim a radius, proximity ranking, or that another city is nearby. If no city remains after update_context and location prompts used is under 3, ask one concise location question and do not recommend a restaurant. If no city remains and prompts used is 3, stop asking; say you cannot confidently recommend somewhere local and offer only these catalog coverage cities: ${JSON.stringify(coverageCities)}. Use the supplied recent history to resolve references such as “that place,” “the last one,” or “more like it.” When offering alternatives, exclude only the referenced ID from this known list: ${JSON.stringify([...priorRecommendationIds])}. Preserve hard requirements, especially dietary needs, using keyword when supported. Treat the prior cuisine label, exact price band, and descriptive wording as soft similarities: never pass a long multi-tag cuisine string as a cuisine filter. If the first alternative search is empty, try one broader search that keeps city, hard dietary needs, and the exclusion but drops soft cuisine/price preferences before asking a question. Use both min_price_level and max_price_level when their wording calls for one exact price band. Then use only supplied catalog facts. Ask one useful question only when it changes a recommendation; once the user has answered a question, deferred the choice to you, or confirmed, recommend from the candidates instead of asking again. If every search this turn returned no candidates, never say you found restaurants and never name a restaurant: state plainly which requirement has no catalog match, using diagnostic.summary as the source of truth, and offer the concrete options it lists in one question. If the user then defers ("whatever", "you pick", "sounds good", or any equivalent) or has already been asked about this conflict, do not ask again: relax the blocking soft preference (cuisine, price, or atmosphere wording) yourself, search again in the same city, and recommend; tell them what you relaxed. City and dietary needs stay hard unless the user explicitly changes them. Any restaurant your reply names must be a tool-returned ID given as recommendation_id or in alternatives. When the user asks to see again a restaurant recommended earlier in the conversation, set recommendation_id to that restaurantId. When they simply choose one of the restaurants you just showed, confirm briefly and set recommendation_id to null; the card is already on screen. Never offer reservations or other actions you cannot perform. Never invent ratings, exact prices, availability, or dietary safety. Never relax a hard requirement without asking. If an empty search result has diagnostic.city_result_count 0, say you cannot confidently recommend a restaurant in that city, offer diagnostic.available_cities, and only search another city if the user explicitly names or accepts it. Never mention databases, tools, errors, outages, or system access to the user. If a search result has status "fallback", recommend from its candidates normally. A tool result with status "invalid_arguments" lists problems: fix them and call again. A tool result with status "budget_exhausted" means answer now with what you already have. If no candidate data is available, say warmly that you are having trouble narrowing the list right now and ask one helpful preference question; never fabricate a restaurant. After tool use, return ONLY JSON: {"reply":"...","recommendation_id":number|null,"why":"...","reasons":["...","..."],"caveat":"...","alternatives":[{"id":number,"why":"...","reasons":["...","..."],"caveat":"...","meal_fit":true|false}]}. recommendation_id must be an ID returned by a tool. Answer shape: when candidates exist, decide; pick the single best fit yourself and never ask whether you should pick or list options for the user to choose from. reply is at most two short sentences naming only the primary pick and its best reason; never describe the alternatives in reply, since they appear as cards. reasons is exactly two short reasons it fits this request. caveat is the single most important limitation for this request; the server already shows dietary modifications (such as "ask them to hold the ghee") on their own line, so do not repeat them in caveat. Alternatives must genuinely fit the meal and request too; set meal_fit to false for any alternative that is not a real fit for this meal and request (for example a dessert shop for lunch); those are not shown. why, reasons, and caveat describe only that restaurant. Put up to two other tool-returned restaurants in alternatives, each with its own reasons and caveat; otherwise use an empty array. Prefer candidates whose fits_planned_meal is true.` },
+    { role: 'system', content: `You are a concise, warm restaurant concierge. Call update_context only when the user's message adds, changes, or removes a saved preference or tonight plan. When it is needed, call it before search_restaurants so searches use the updated context; never make an empty update_context call. Saved preferences are durable statements about the user (for example, “I’m vegan”). Tonight plans include city, budget, time, companions, group size, and occasion. LOCATION GATE: do not call search_restaurants unless the resulting context contains a city. With a city, search that exact city only. This catalog has no coordinates, so never claim a radius, proximity ranking, or that another city is nearby. If no city remains after considering the message and current context and location prompts used is under 3, ask one concise location question and do not recommend a restaurant. If no city remains and prompts used is 3, stop asking; say you cannot confidently recommend somewhere local and offer only these catalog coverage cities: ${JSON.stringify(coverageCities)}. Use the supplied recent history to resolve references such as “that place,” “the last one,” or “more like it.” When offering alternatives, exclude only the referenced ID from this known list: ${JSON.stringify([...priorRecommendationIds])}. Preserve hard requirements, especially dietary needs, using keyword when supported. Treat the prior cuisine label, exact price band, and descriptive wording as soft similarities: never pass a long multi-tag cuisine string as a cuisine filter. If the first alternative search is empty, try one broader search that keeps city, hard dietary needs, and the exclusion but drops soft cuisine/price preferences before asking a question. Use both min_price_level and max_price_level when their wording calls for one exact price band. Then use only supplied catalog facts. Ask one useful question only when it changes a recommendation; once the user has answered a question, deferred the choice to you, or confirmed, recommend from the candidates instead of asking again. If every search this turn returned no candidates, never say you found restaurants and never name a restaurant: state plainly which requirement has no catalog match, using diagnostic.summary as the source of truth, and offer the concrete options it lists in one question. If the user then defers ("whatever", "you pick", "sounds good", or any equivalent) or has already been asked about this conflict, do not ask again: relax the blocking soft preference (cuisine, price, or atmosphere wording) yourself, search again in the same city, and recommend; tell them what you relaxed. City and dietary needs stay hard unless the user explicitly changes them. Any restaurant your reply names must be a tool-returned ID given as recommendation_id or in alternatives. When the user asks to see again a restaurant recommended earlier in the conversation, set recommendation_id to that restaurantId. When they simply choose one of the restaurants you just showed, confirm briefly and set recommendation_id to null; the card is already on screen. Never offer reservations or other actions you cannot perform. Never invent ratings, exact prices, availability, or dietary safety. Never relax a hard requirement without asking. If an empty search result has diagnostic.city_result_count 0, say you cannot confidently recommend a restaurant in that city, offer diagnostic.available_cities, and only search another city if the user explicitly names or accepts it. Never mention databases, tools, errors, outages, or system access to the user. If a search result has status "fallback", recommend from its candidates normally. A tool result with status "invalid_arguments" lists problems: fix them and call again. A tool result with status "budget_exhausted" means answer now with what you already have. If no candidate data is available, say warmly that you are having trouble narrowing the list right now and ask one helpful preference question; never fabricate a restaurant. After tool use, return ONLY JSON: {"reply":"...","recommendation_id":number|null,"why":"...","reasons":["...","..."],"caveat":"...","alternatives":[{"id":number,"why":"...","reasons":["...","..."],"caveat":"...","meal_fit":true|false}]}. recommendation_id must be an ID returned by a tool. Answer shape: when candidates exist, decide; pick the single best fit yourself and never ask whether you should pick or list options for the user to choose from. reply is at most two short sentences naming only the primary pick and its best reason; never describe the alternatives in reply, since they appear as cards. reasons is exactly two short reasons it fits this request. caveat is the single most important limitation for this request; the server already shows dietary modifications (such as "ask them to hold the ghee") on their own line, so do not repeat them in caveat. Alternatives must genuinely fit the meal and request too; set meal_fit to false for any alternative that is not a real fit for this meal and request (for example a dessert shop for lunch); those are not shown. why, reasons, and caveat describe only that restaurant. Put up to two other tool-returned restaurants in alternatives, each with its own reasons and caveat; otherwise use an empty array. Prefer candidates whose fits_planned_meal is true.` },
     { role: 'system', content: `Personalization rule: saved preferences are context, not an automatic decision. Treat hard requirements such as dietary restrictions as constraints; treat prior cuisines, cities, and restaurants as soft signals that may inform a question or tie-break only after the user states what they want for this outing. Never recommend a restaurant solely because it matches a remembered preference, and do not repeatedly steer the user toward a remembered cuisine or place. This is ${isOpeningTurn ? 'the opening user turn of a new conversation' : 'an ongoing conversation'}. On an opening turn without a concrete dining request, ask one broad, open-ended question about what they feel like eating; do not search or recommend. A concrete request includes a cuisine, dish, meal type, occasion, location, budget, dietary need, or direct request for a recommendation, including asking you to choose for them. Use the user’s new message and current-outing context as the primary signal; only mention a saved preference when it directly helps resolve an ambiguity.` },
     { role: 'system', content: `Delegation: when the user hands the choice to you ("surprise me", "pick for me", "you decide", "anything", or any equivalent), cuisine, price, and atmosphere are open; never ask about them. The city is the only thing you may still ask for. Once a city is confirmed in this conversation, search it using only hard requirements already in context (dietary needs such as vegan or gluten-free, passed as keyword) and recommend one restaurant plus alternatives. Location: always store city in tonight, never in saved. People eat in different cities from day to day, so a city counts only once the user says they are eating there for this outing, or confirms it. Where they live, work, or are based is background, not tonight's location: ask "Eating in <that city> tonight?" before storing or searching it. If the user says they will go anywhere ("I'll drive anywhere", "any city", "wherever"), that answers the location question: never ask for a city again. The server records the city as "Anywhere" (possibly "Anywhere except <cities they ruled out>"); search right away and recommend. Results may come from any catalog city, so name each suggested restaurant's city in the reply. ${previousCity ? `Their last-used city was ${previousCity}. Whenever you ask for a location, your question MUST name it as a quick confirmation, for example "Still eating in ${previousCity}, or somewhere else?"; never store or search it until they confirm.` : ''}` },
     { role: 'system', content: 'Non-negotiable location wording: this catalog only has city names, not coordinates. Never describe a different city as nearby, closest, local to, within a radius, or a short drive. When coverage is missing, say only that the catalog includes records in named other cities.' },
@@ -736,7 +744,7 @@ export async function chat({ message, context = [], history = [], locationPrompt
   const toolNames = new Map()
   const deadline = Date.now() + TURN_DEADLINE_MS
   // Ends the turn gracefully (keeping any context already captured) when time or steps run out.
-  const stopEarly = reason => (log('warn', reason), {
+  const stopEarly = reason => (log('warn', `${reason} after ${Date.now() - startedAt}ms`), {
     reply: 'I’m having trouble narrowing this down right now. Could you try again in a moment?',
     alternatives: [],
     context: current,
@@ -754,9 +762,10 @@ export async function chat({ message, context = [], history = [], locationPrompt
     if (Date.now() >= deadline) return stopEarly('Stopped: took too long')
     // Corrective retries need a spare round and spare time.
     const canRetry = round < MAX_ROUNDS - 1 && deadline - Date.now() > 3000
-    // The first call is forced to update_context so preferences are captured before anything else.
+    // Context updates are optional: unchanged turns can search or answer in their first model call.
+    // The prompt requires an update before a search whenever the user changed context.
     // On the last round, or once the tool budget is spent, tools are disabled so the model must answer.
-    const toolChoice = round === 0 ? { type: 'function', function: { name: 'update_context' } } : round === MAX_ROUNDS - 1 || toolCalls >= MAX_TOOL_CALLS ? 'none' : 'auto'
+    const toolChoice = round === MAX_ROUNDS - 1 || toolCalls >= MAX_TOOL_CALLS ? 'none' : 'auto'
     let response
     const callStarted = Date.now()
     log('debug', `Model call ${round + 1}`, { tool_choice: typeof toolChoice === 'string' ? toolChoice : toolChoice.function.name, messages: messages.length })
@@ -884,6 +893,14 @@ export async function chat({ message, context = [], history = [], locationPrompt
       const lastCandidates = (() => { try { return JSON.parse(lastSearch?.result || '{}').candidates || [] } catch { return [] } })()
       const lastSearchQualifies = lastCandidates.some(item => !requirementProblems(item, current, planTarget()).length)
       log('info', `Turn finished in ${Date.now() - startedAt}ms`, { recommendation: primary?.name || null, alternatives: alternatives.map(item => item.name), tool_calls: toolCalls })
+      // One card can look like a bug. When the search was complete (under the limit) and only the pick meets every
+      // hard requirement, say so, using the user's own city.
+      const qualifying = [...records.values()].filter(item => !requirementProblems(item, current, planTarget()).length)
+      const lastCount = lastCandidates.length
+      if (primary && !repeatsLast && !alternatives.length && qualifying.length === 1 && lastCount < SEARCH_LIMIT) {
+        const city = current.find(item => item.key === 'city')?.value
+        final.reply = `${String(final.reply || '').trim()} It’s the only place${city && !openLocation(city) ? ` in ${city}` : ''} I found that fits everything you asked for.`.trim()
+      }
       return {
         reply: final.reply || 'What sounds good?',
         recommendation: primary && !repeatsLast ? card(primary, final.why, distinctCaveat(primary, final.caveat), extrasFor(primary, final)) : undefined,
@@ -900,12 +917,14 @@ export async function chat({ message, context = [], history = [], locationPrompt
     // --- Run the requested tools; each result goes back to the model as a tool message ---
     for (const call of assistant.tool_calls) {
       toolCalls++
+      const toolStarted = Date.now()
       const { args, problems } = validateToolArgs(call.function.name, call.function.arguments, new Set([...records.keys(), ...priorRecommendationIds]))
       let output
       // Every tool call needs a tool message back, so over-budget and invalid calls are answered, not dropped.
       if (toolCalls > MAX_TOOL_CALLS || problems.length) {
         output = toolCalls > MAX_TOOL_CALLS ? { status: 'budget_exhausted' } : { status: 'invalid_arguments', problems }
         events.push(event(call.function.name, 'error', toolCalls > MAX_TOOL_CALLS ? 'Skipped: step limit reached' : 'Rejected invalid request', { raw: call.function.arguments }, output))
+        log('info', `Tool ${call.function.name} completed in ${Date.now() - toolStarted}ms`, { status: output.status })
         messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(output) })
         continue
       }
@@ -961,12 +980,14 @@ export async function chat({ message, context = [], history = [], locationPrompt
           if (locationRecheck) {
             output = { status: 'location_check_required', instruction: RECHECK_INSTRUCTION }
             events.push(event('search_restaurants', 'complete', 'Checking location first', args, output))
+            log('info', `Tool ${call.function.name} completed in ${Date.now() - toolStarted}ms`, { status: output.status })
             messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(output) })
             continue
           }
           if (!city) {
             output = { status: 'location_required' }
             events.push(event('search_restaurants', 'complete', 'Waiting for location', args, output))
+            log('info', `Tool ${call.function.name} completed in ${Date.now() - toolStarted}ms`, { status: output.status })
             messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(output) })
             continue
           }
@@ -1028,6 +1049,7 @@ export async function chat({ message, context = [], history = [], locationPrompt
           events.push(event(call.function.name, 'error', 'Tool failed', args, output))
         }
       }
+      log('info', `Tool ${call.function.name} completed in ${Date.now() - toolStarted}ms`, { status: output?.status || (output?.error ? 'error' : 'ok') })
       messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(output) })
     }
   }
