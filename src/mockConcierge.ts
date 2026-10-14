@@ -25,10 +25,10 @@ function merge(context: Detail[], changes: Partial<Record<string, string>>) {
   return next
 }
 
-export async function askConcierge(message: string, context: Detail[], history: HistoryItem[], locationPromptCount: number, lastCity?: string): Promise<ConciergeResponse> {
+export async function askConcierge(message: string, context: Detail[], history: HistoryItem[], locationPromptCount: number, lastCity?: string, localTime?: string): Promise<ConciergeResponse> {
   const response = await fetch('/api/chat', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, context, history, locationPromptCount, lastCity })
+    body: JSON.stringify({ message, context, history, locationPromptCount, lastCity, localTime })
   })
   const data = await response.json() as ConciergeResponse & { error?: string }
   if (!response.ok) throw new Error(data.error || 'The concierge is unavailable.')

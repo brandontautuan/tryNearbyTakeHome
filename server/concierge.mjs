@@ -17,14 +17,19 @@ const select = 'id,name,address,city,cuisine,price_level,hours_text,context_text
 // Read-through cache of only catalog records previously returned by Supabase.
 // It never fabricates a restaurant and never writes to the database.
 const recentCatalog = new Map()
+// Results are unranked, so a small limit silently drops good matches; the UI still caps alternatives separately.
+const SEARCH_LIMIT = 5
 const label = { city: 'City', budget: 'Budget', time: 'Time', companions: 'Companions', group: 'Group size', occasion: 'Occasion', vibe: 'Atmosphere', diet: 'Dietary needs', cuisine: 'Cuisine' }
 
 const tools = [
-  { type: 'function', function: { name: 'update_context', description: 'Change only specified context. Preserve unrelated saved preferences and tonight plans. Put explicit enduring statements about the user in saved (for example “I am vegan” or “I usually prefer quiet places”). Put this outing’s city, budget, time, companions, group size, and occasion in tonight.', parameters: { type: 'object', additionalProperties: false, properties: { scope: { type: 'string', enum: ['saved', 'tonight'], description: 'saved for durable user preferences; tonight for this outing only.' }, set: { type: 'object', description: 'Fields to add or replace, with string values.', additionalProperties: { type: 'string' } }, remove: { type: 'array', description: 'Field keys to remove only from the named scope.', items: { type: 'string' } } }, required: ['scope'] } } },
-  { type: 'function', function: { name: 'search_restaurants', description: 'Search the supplied catalog by supported filters. Search before recommending. Use min_price_level and max_price_level together to request one exact price band. Use exclude_restaurant_ids for requests such as “more like that” so you do not repeat an earlier recommendation.', parameters: { type: 'object', additionalProperties: false, properties: { city: { type: 'string', description: 'A canonical city name inferred from the user’s wording.' }, min_price_level: { type: 'integer', minimum: 1, maximum: 4 }, max_price_level: { type: 'integer', minimum: 1, maximum: 4 }, cuisine: { type: 'string', description: 'A cuisine style such as Mexican or ramen. Dietary needs like vegan or gluten-free go in keyword, not here.' }, keyword: { type: 'string', description: 'One short word or phrase that must appear in the restaurant’s listed context, for dietary needs or atmosphere (for example “vegan”, “gluten”, “quiet”, “patio”). Omit when not needed.' }, exclude_restaurant_ids: { type: 'array', description: 'Earlier recommendation IDs to omit when presenting alternatives.', items: { type: 'integer' } } } } } },
+  { type: 'function', function: { name: 'update_context', description: 'Change only specified context. Preserve unrelated saved preferences and tonight plans. Put explicit enduring statements about the user in saved (for example “I am vegan” or “I usually prefer quiet places”). Put this outing’s city, budget, time, companions, group size, and occasion in tonight.', parameters: { type: 'object', additionalProperties: false, properties: { scope: { type: 'string', enum: ['saved', 'tonight'], description: 'saved for durable user preferences; tonight for this outing only.' }, set: { type: 'object', description: 'Fields to add or replace. Only these fields exist; never store restaurant IDs, search keywords, or anything else.', additionalProperties: false, properties: Object.fromEntries(Object.keys(label).map(key => [key, { type: 'string', description: label[key] }])) }, remove: { type: 'array', description: 'Field keys to remove only from the named scope.', items: { type: 'string', enum: Object.keys(label) } }, new_outing: { type: 'boolean', description: 'true when the user signals a new outing: they are back later, it is a different meal or time, or they are with different people. Clears the previous tonight plans before applying set.' } }, required: ['scope'] } } },
+  { type: 'function', function: { name: 'search_restaurants', description: 'Search the supplied catalog by supported filters. Search before recommending. Use min_price_level and max_price_level together to request one exact price band. Use exclude_restaurant_ids for requests such as “more like that” so you do not repeat an earlier recommendation.', parameters: { type: 'object', additionalProperties: false, properties: { city: { type: 'string', description: 'A canonical city name inferred from the user’s wording.' }, min_price_level: { type: 'integer', minimum: 1, maximum: 4 }, max_price_level: { type: 'integer', minimum: 1, maximum: 4 }, cuisine: { type: 'string', description: 'A cuisine style such as Mexican or ramen. Dietary needs like vegan or gluten-free go in keyword, not here.' }, keyword: { type: 'string', description: 'One short word or phrase that must appear in the restaurant’s listed context, for dietary needs or atmosphere (for example “vegan”, “gluten”, “quiet”, “patio”). Omit when not needed.' }, exclude_restaurant_ids: { type: 'array', description: 'Only when the user asks for different or more options than ones already shown: those earlier IDs. Never when the user is refining requirements (for example adding a dietary need).', items: { type: 'integer' } } } } } },
   { type: 'function', function: { name: 'get_restaurant_details', description: 'Retrieve complete supplied details for a restaurant returned from search.', parameters: { type: 'object', additionalProperties: false, properties: { restaurant_id: { type: 'integer' } }, required: ['restaurant_id'] } } }
 ]
 
+// Context is a fixed set of fields; common synonyms map onto them and anything else (e.g. restaurant_id) is dropped.
+const contextAliases = { dietary: 'diet', dietary_needs: 'diet', dietary_restrictions: 'diet', diet_preference: 'diet', dietary_preference: 'diet', cuisine_preference: 'cuisine', group_size: 'group', party_size: 'group', atmosphere: 'vibe', ambiance: 'vibe', location: 'city', companion: 'companions' }
+function contextKey(key) { const k = String(key || '').toLowerCase().trim().replace(/[\s-]+/g, '_'); return label[k] ? k : contextAliases[k] || null }
 // Where someone eats changes outing to outing, so location is never a saved preference.
 function isLocationKey(key) { return /city|location|neighbo|area|address|zip|town/i.test(key) }
 // True when `text` contains `target` allowing a couple of typos ("irivine" ≈ "Irvine").
@@ -50,9 +55,11 @@ function onlyBackgroundMention(text, target) {
   return mentions > 0 && mentions === background
 }
 function applyContext(context, args) {
-  const scope = args.scope === 'saved' ? 'saved' : 'tonight', set = args.set || {}, remove = Array.isArray(args.remove) ? args.remove : []
+  const cleared = args.new_outing === true ? context.filter(item => item.kind === 'tonight') : []
+  if (cleared.length) context = context.filter(item => item.kind !== 'tonight')
+  const scope = args.scope === 'saved' ? 'saved' : 'tonight', set = Object.fromEntries(Object.entries(args.set || {}).map(([field, value]) => [contextKey(field), value]).filter(([field]) => field)), remove = Array.isArray(args.remove) ? args.remove.map(contextKey).filter(Boolean) : []
   const next = context.filter(item => !(item.kind === scope && remove.includes(item.key))).map(item => ({ ...item }))
-  const changes = []
+  const changes = cleared.map(item => ({ field: item.label, from: item.value, to: 'removed' }))
   for (const [field, input] of Object.entries(set)) {
     const value = String(input).trim(); if (!value) continue
     const fieldScope = isLocationKey(field) ? 'tonight' : scope
@@ -108,10 +115,10 @@ function cachedSearch({ city, min_price_level, max_price_level, cuisine, keyword
   ).slice(0, 3)
 }
 
-export async function chat({ message, context = [], history = [], locationPromptCount = 0, lastCity = '' }) {
+export async function chat({ message, context = [], history = [], locationPromptCount = 0, lastCity = '', localTime = '' }) {
   if (typeof message !== 'string' || !message.trim() || message.length > 12000) throw new Error('A message up to 12,000 characters is required.')
   // Collapse duplicate entries (same scope and key), keeping the latest value, so stale or repeated context never accumulates.
-  let current = Array.isArray(context) ? [...new Map(context.filter(item => item?.key && String(item.value ?? '').trim() && !(item.kind === 'saved' && isLocationKey(item.key))).map(item => [`${item.kind}:${item.key}`, { ...item }])).values()] : []
+  let current = Array.isArray(context) ? [...new Map(context.map(item => ({ ...item, key: contextKey(item?.key) })).filter(item => item.key && String(item.value ?? '').trim() && !(item.kind === 'saved' && isLocationKey(item.key))).map(item => [`${item.kind}:${item.key}`, { ...item, label: label[item.key] }])).values()] : []
   const previousCity = typeof lastCity === 'string' ? lastCity.trim().slice(0, 80) : ''
   const events = [], records = new Map()
   const recentHistory = Array.isArray(history) ? history.slice(-12).filter(item => item && (item.role === 'user' || item.role === 'assistant')).map(item => ({ role: item.role, text: String(item.text || '').slice(0, 2000), recommendation: item.recommendation && { restaurantId: item.recommendation.restaurantId, name: item.recommendation.name, cuisine: item.recommendation.cuisine, price: item.recommendation.price }, alternatives: Array.isArray(item.alternatives) ? item.alternatives.filter(alt => Number.isInteger(alt?.restaurantId)).slice(0, 3).map(alt => ({ restaurantId: alt.restaurantId, name: alt.name })) : [] })) : []
@@ -130,6 +137,8 @@ export async function chat({ message, context = [], history = [], locationPrompt
   messages.splice(1, 0, { role: 'system', content: `Personalization rule: saved preferences are context, not an automatic decision. Treat hard requirements such as dietary restrictions as constraints; treat prior cuisines, cities, and restaurants as soft signals that may inform a question or tie-break only after the user states what they want for this outing. Never recommend a restaurant solely because it matches a remembered preference, and do not repeatedly steer the user toward a remembered cuisine or place. This is ${isOpeningTurn ? 'the opening user turn of a new conversation' : 'an ongoing conversation'}. On an opening turn without a concrete dining request, ask one broad, open-ended question about what they feel like eating; do not search or recommend. A concrete request includes a cuisine, dish, meal type, occasion, location, budget, dietary need, or direct request for a recommendation, including asking you to choose for them. Use the user’s new message and current-outing context as the primary signal; only mention a saved preference when it directly helps resolve an ambiguity.` })
   messages.splice(2, 0, { role: 'system', content: `Delegation: when the user hands the choice to you ("surprise me", "pick for me", "you decide", "anything", or any equivalent), cuisine, price, and atmosphere are open; never ask about them. The city is the only thing you may still ask for. Once a city is confirmed in this conversation, search it using only hard requirements already in context (dietary needs such as vegan or gluten-free, passed as keyword) and recommend one restaurant plus alternatives. Location: always store city in tonight, never in saved. People eat in different cities from day to day, so a city counts only once the user says they are eating there for this outing, or confirms it. Where they live, work, or are based is background, not tonight's location: ask "Eating in <that city> tonight?" before storing or searching it. ${previousCity ? `Their last-used city was ${previousCity}. Whenever you ask for a location, your question MUST name it as a quick confirmation, for example "Still eating in ${previousCity}, or somewhere else?"; never store or search it until they confirm.` : ''}` })
   messages.splice(3, 0, { role: 'system', content: 'Non-negotiable location wording: this catalog only has city names, not coordinates. Never describe a different city as nearby, closest, local to, within a radius, or a short drive. When coverage is missing, say only that the catalog includes records in named other cities.' })
+  const userTime = typeof localTime === 'string' ? localTime.trim().slice(0, 60) : ''
+  messages.splice(messages.length - 1, 0, { role: 'system', content: `Outings: when the user signals a new outing (they are back, it is a different meal or time, or they are with different people), the previous tonight plans no longer apply. In that turn's update_context, remove the old tonight fields (city, companions, group, occasion, time, budget, and any diet that belonged to a companion), then confirm the city again before searching; do not assume the old city. A companion's dietary need ("my girlfriend is vegan") is a tonight diet, never saved. Record who they are with in companions. If the user names a city and leaves the rest open ("anything around here", "whatever's good"), that is delegation: search and recommend in that turn without asking about cuisine or vibe. Hours: ${userTime ? `the user's local time is ${userTime} (for reasoning only; store time in context only when the user states one). ` : ''}When the user mentions a meal, a time, or "now", read each candidate's hours_text and prefer places open then; never recommend a place listed as closed at that time without saying so in the caveat. Also prefer places whose listed context fits the stated group and occasion.` })
   let corrected = false
   for (let round = 0; round < 6; round++) {
     const response = await ai.chat.completions.create({ model: env.OPENROUTER_MODEL || 'openai/gpt-4.1-mini', messages, tools, tool_choice: round === 0 ? { type: 'function', function: { name: 'update_context' } } : 'auto', temperature: 0.2 })
@@ -155,6 +164,17 @@ export async function chat({ message, context = [], history = [], locationPrompt
         messages.push({ role: 'user', content: `Correction: ${Number.isInteger(final.recommendation_id) ? 'that recommendation_id was not returned by a tool this turn.' : 'the user already answered your previous question.'} Recommend now using only these tool-returned IDs: ${[...records.keys()].join(', ')}. Do not ask another preference question. Return the same JSON shape.` })
         continue
       }
+      // Two more backchecks: naming a found restaurant without attaching its card, and asking a question
+      // mid-conversation while a confirmed city exists and no search was run this turn.
+      const shownBefore = new Set(recentHistory.flatMap(item => [item.recommendation?.restaurantId, ...(item.alternatives || []).map(alt => alt.restaurantId)]).filter(Number.isInteger))
+      const namedWithoutCard = !record && [...records.values()].some(item => !shownBefore.has(item.id) && String(final.reply || '').toLowerCase().includes(item.name.toLowerCase()))
+      const confirmedCity = current.some(item => item.key === 'city' && item.value?.trim())
+      const askedInsteadOfSearching = !record && !isOpeningTurn && confirmedCity && !events.some(item => item.tool === 'search_restaurants') && /\?\s*$/.test(String(final.reply || '').trim())
+      if (!corrected && (namedWithoutCard || askedInsteadOfSearching)) {
+        corrected = true
+        messages.push({ role: 'user', content: namedWithoutCard ? `Correction: your reply names a restaurant returned by a tool but recommendation_id is null. Set recommendation_id (and alternatives) to the IDs you describe: ${[...records.keys()].join(', ')}. Return the same JSON shape.` : 'Correction: the city is confirmed. Do not ask about cuisine, price, or vibe. Search that city now with only the hard requirements in context and recommend; ask a question only if the search returns no candidates. Return the same JSON shape.' })
+        continue
+      }
       const resolvedCity = current.some(item => item.key === 'city' && item.value?.trim())
       const locationState = resolvedCity ? 'resolved' : priorLocationPrompts >= 3 ? 'exhausted' : 'asked'
       const alternatives = record && Array.isArray(final.alternatives) ? [...new Map(final.alternatives.filter(item => Number.isInteger(item?.id) && item.id !== record.id && records.has(item.id)).map(item => [item.id, item])).values()].slice(0, 2).map(item => card(records.get(item.id), item.why, item.caveat)) : []
@@ -170,7 +190,9 @@ export async function chat({ message, context = [], history = [], locationPrompt
       try {
         if (call.function.name === 'update_context') {
           // A location only counts once the user states it, or answers a question that named it; a remembered city is never assumed.
-          const lastAssistantText = [...recentHistory].reverse().find(item => item.role === 'assistant')?.text || ''
+          // The previous reply only counts as offering a city when it asked a question.
+          const previousReply = [...recentHistory].reverse().find(item => item.role === 'assistant')?.text || ''
+          const lastAssistantText = previousReply.includes('?') ? previousReply : ''
           const unconfirmed = Object.entries(args.set || {}).filter(([field, value]) => isLocationKey(field) && ((!looselyMentions(message, String(value)) && !looselyMentions(lastAssistantText, String(value))) || (onlyBackgroundMention(message, String(value)) && !looselyMentions(lastAssistantText, String(value))))).map(([field]) => field)
           if (unconfirmed.length) { args.set = Object.fromEntries(Object.entries(args.set).filter(([field]) => !unconfirmed.includes(field))) }
           const result = applyContext(current, args); current = result.next; output = unconfirmed.length ? { ...result, not_saved: unconfirmed, reason: 'The user has not confirmed this location in this conversation. Ask them to confirm it.' } : result
@@ -186,11 +208,13 @@ export async function chat({ message, context = [], history = [], locationPrompt
           const city = currentCity
           args.city = city
           const excluded = Array.isArray(args.exclude_restaurant_ids) ? args.exclude_restaurant_ids.filter(id => Number.isInteger(id) && priorRecommendationIds.has(id)) : []
+          // Excluding a restaurant from another city is a no-op; drop it so the trace stays honest.
+          excluded.splice(0, excluded.length, ...excluded.filter(id => !recentCatalog.get(id) || recentCatalog.get(id).city.toLowerCase() === city.toLowerCase()))
           args.exclude_restaurant_ids = excluded
           // The same term in both filters (e.g. "vegan") would require it in the cuisine label too; keep it only as a keyword.
           if (typeof args.cuisine === 'string' && typeof args.keyword === 'string' && args.cuisine.trim().toLowerCase() === args.keyword.trim().toLowerCase()) args.cuisine = ''
           const filters = { min_price_level: args.min_price_level, max_price_level: args.max_price_level, cuisine: args.cuisine, keyword: args.keyword, excluded }
-          const { data, error } = await applyFilters(db.from('restaurants').select(select).limit(3).ilike('city', city), filters); if (error) throw error
+          const { data, error } = await applyFilters(db.from('restaurants').select(select).limit(SEARCH_LIMIT).ilike('city', city), filters); if (error) throw error
           cacheRecords(data); for (const item of data || []) records.set(item.id, item)
           output = data?.length ? data : { candidates: [], diagnostic: await emptyResultDiagnostic(city, filters) }
           events.push(event('search_restaurants', 'complete', data?.length ? `${data.length} candidates found` : 'No candidates found', args, data?.map(x => ({ id: x.id, name: x.name })) || []))
