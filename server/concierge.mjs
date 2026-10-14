@@ -219,13 +219,33 @@ function onlyBackgroundMention(text, target) {
   }
   return mentions > 0 && mentions === background
 }
+// "I'll drive anywhere", "any city is fine": the user is open to every catalog city. That answers the
+// location question, so it is stored as the city value "Anywhere" (see openLocation) instead of being asked again.
+const OPEN_LOCATION = /\b(any ?where|any city|any town|any place|wherever|doesn'?t matter where|don'?t care where)\b/i
+// Parses an open-location city value: "Anywhere" or "Anywhere except Santa Ana, Irvine". Null for a real city.
+function openLocation(value) {
+  const match = /^anywhere(?:\s+except\s+(.+))?$/i.exec(String(value || '').trim())
+  return match ? { except: match[1] ? match[1].split(/\s*(?:,|\band\b)\s*/i).map(city => city.trim()).filter(Boolean) : [] } : null
+}
+function openLocationValue(except) { return except.length ? `Anywhere except ${except.join(', ')}` : 'Anywhere' }
+// Catalog cities the message rules out ("she doesn't wanna go to Santa Ana", "not Irvine").
+function ruledOutCities(message, cities) {
+  const lower = message.toLowerCase()
+  return cities.filter(city => {
+    const needle = city.toLowerCase()
+    for (let index = lower.indexOf(needle); index !== -1; index = lower.indexOf(needle, index + needle.length)) {
+      if (/\b(not|no|don'?t|doesn'?t|dont|doesnt|never|avoid|except|other than|besides|but)\b[\s\w']{0,25}$/.test(lower.slice(Math.max(0, index - 40), index))) return true
+    }
+    return false
+  })
+}
 // Location fields in an update_context `set` the user has not confirmed: the value appears in neither
 // the user's message nor the assistant's last question, or the user mentioned it only as background
-// ("I live in …") and the assistant never asked about it.
+// ("I live in …") and the assistant never asked about it. Open-location values are set by the server and always pass.
 function unconfirmedLocations(set, message, lastQuestion) {
   return Object.entries(set || {})
     .filter(([field, value]) => {
-      if (!isLocationKey(field)) return false
+      if (!isLocationKey(field) || openLocation(value)) return false
       const inMessage = looselyMentions(message, String(value)), askedAbout = looselyMentions(lastQuestion, String(value))
       return (!inMessage && !askedAbout) || (onlyBackgroundMention(message, String(value)) && !askedAbout)
     })
@@ -265,6 +285,12 @@ async function catalogCities() {
 }
 // Escapes LIKE wildcards so a keyword such as "100%" is matched literally.
 function escapeLike(text) { return text.replace(/[\\%_]/g, '\\$&') }
+// Restricts a query to the context city; an open location searches every city except the ruled-out ones.
+function inLocation(query, city) {
+  const open = openLocation(city)
+  if (!open) return query.ilike('city', city)
+  return open.except.length ? query.not('city', 'in', `(${open.except.map(item => `"${item.replace(/"/g, '')}"`).join(',')})`) : query
+}
 // Adds the optional search filters to a Supabase query. The caller applies the city.
 function applyFilters(query, { min_price_level, max_price_level, cuisine, keyword, excluded = [] }) {
   if (Number.isInteger(min_price_level)) query = query.gte('price_level', min_price_level)
@@ -277,10 +303,13 @@ function applyFilters(query, { min_price_level, max_price_level, cuisine, keywor
 // Explains an empty search by re-running it with each filter dropped, so the
 // agent can name the blocking requirement and offer real catalog alternatives.
 async function emptyResultDiagnostic(city, filters) {
+  const open = openLocation(city)
+  // How the summary names the searched area.
+  const where = open ? 'any allowed catalog city' : city
   // Matching rows (in `city` unless inCity is false), or null if the query failed.
   const rows = async (f, inCity = true) => {
     let query = applyFilters(db.from('restaurants').select('city').limit(100), f)
-    if (inCity) query = query.ilike('city', city)
+    if (inCity) query = inLocation(query, city)
     const { data, error } = await query
     return error ? null : data
   }
@@ -295,11 +324,12 @@ async function emptyResultDiagnostic(city, filters) {
     const relaxed = k === 'price' ? { ...filters, min_price_level: undefined, max_price_level: undefined } : { ...filters, [k]: undefined }
     matchesIfDropped[k] = (await rows(relaxed))?.length ?? null
   }
-  const otherCities = [...new Set(((await rows(filters, false)) || []).map(item => item.city))].filter(item => item.toLowerCase() !== city.toLowerCase()).sort()
+  // An open search already covered every allowed city, so there are no "other cities" to suggest.
+  const otherCities = open ? [] : [...new Set(((await rows(filters, false)) || []).map(item => item.city))].filter(item => item.toLowerCase() !== city.toLowerCase()).sort()
   const blocking = used.find(k => matchesIfDropped[k] > 0) || (otherCities.length ? 'city' : 'refine_preferences')
   const summary = [
-    `0 restaurants in ${city} match every requested filter.`,
-    ...used.map(k => `Dropping only the ${k} filter would leave ${matchesIfDropped[k] ?? 'an unknown number of'} restaurants in ${city}.`),
+    `0 restaurants in ${where} match every requested filter.`,
+    ...used.map(k => `Dropping only the ${k} filter would leave ${matchesIfDropped[k] ?? 'an unknown number of'} restaurants in ${where}.`),
     otherCities.length ? `The same filters do match in other catalog cities: ${otherCities.join(', ')}.` : 'No other catalog city matches the same filters.'
   ].join(' ')
   return { city, city_result_count: cityRows?.length ?? null, summary, matches_if_dropped: matchesIfDropped, same_filters_in_other_cities: otherCities, blocking_constraint: blocking }
@@ -307,10 +337,11 @@ async function emptyResultDiagnostic(city, filters) {
 // In-memory version of the search over recentCatalog. Used only when Supabase errors.
 function cachedSearch({ city, min_price_level, max_price_level, cuisine, keyword, exclude_restaurant_ids = [] }) {
   const normalizedCity = typeof city === 'string' ? city.trim() : city
+  const open = openLocation(normalizedCity)
   const excluded = new Set(Array.isArray(exclude_restaurant_ids) ? exclude_restaurant_ids.filter(Number.isInteger) : [])
   return [...recentCatalog.values()].filter(record =>
     !excluded.has(record.id) &&
-    (!normalizedCity || record.city.toLowerCase() === normalizedCity.toLowerCase()) &&
+    (open ? !open.except.some(item => item.toLowerCase() === record.city.toLowerCase()) : !normalizedCity || record.city.toLowerCase() === normalizedCity.toLowerCase()) &&
     (!Number.isInteger(min_price_level) || record.price_level >= min_price_level) &&
     (!Number.isInteger(max_price_level) || record.price_level <= max_price_level) &&
     (!cuisine || record.cuisine.toLowerCase().includes(cuisine.toLowerCase())) &&
@@ -403,7 +434,9 @@ function dietChecks(context) {
 function requirementProblems(record, context) {
   const problems = []
   const city = context.find(item => item.key === 'city' && item.value?.trim())?.value
-  if (city && record.city.toLowerCase() !== city.trim().toLowerCase()) problems.push(`it is in ${record.city}, not ${city}`)
+  const open = openLocation(city)
+  if (open) { if (open.except.some(item => item.toLowerCase() === record.city.toLowerCase())) problems.push(`it is in ${record.city}, which the user ruled out`) }
+  else if (city && record.city.toLowerCase() !== city.trim().toLowerCase()) problems.push(`it is in ${record.city}, not ${city}`)
   const listing = `${record.cuisine} ${record.context_text || ''}`.toLowerCase()
   for (const { term, evidence } of dietChecks(context)) if (!evidence.some(word => listing.includes(word))) problems.push(`its listing does not mention ${term} options`)
   return problems
@@ -444,7 +477,7 @@ function buildMessages({ message, current, recentHistory, priorRecommendationIds
   return [
     { role: 'system', content: `You are a concise, warm restaurant concierge. Your FIRST action on every turn must be update_context: extract explicit preferences or plans from the user's message, preserve unrelated context, and use an empty update when there is nothing to change. Saved preferences are durable statements about the user (for example, “I’m vegan”). Tonight plans include city, budget, time, companions, group size, and occasion. LOCATION GATE: after update_context, do not call search_restaurants unless its resulting context contains a city. With a city, search that exact city only. This catalog has no coordinates, so never claim a radius, proximity ranking, or that another city is nearby. If no city remains after update_context and location prompts used is under 3, ask one concise location question and do not recommend a restaurant. If no city remains and prompts used is 3, stop asking; say you cannot confidently recommend somewhere local and offer only these catalog coverage cities: ${JSON.stringify(coverageCities)}. Use the supplied recent history to resolve references such as “that place,” “the last one,” or “more like it.” When offering alternatives, exclude only the referenced ID from this known list: ${JSON.stringify([...priorRecommendationIds])}. Preserve hard requirements, especially dietary needs, using keyword when supported. Treat the prior cuisine label, exact price band, and descriptive wording as soft similarities: never pass a long multi-tag cuisine string as a cuisine filter. If the first alternative search is empty, try one broader search that keeps city, hard dietary needs, and the exclusion but drops soft cuisine/price preferences before asking a question. Use both min_price_level and max_price_level when their wording calls for one exact price band. Then use only supplied catalog facts. Ask one useful question only when it changes a recommendation; once the user has answered a question, deferred the choice to you, or confirmed, recommend from the candidates instead of asking again. If every search this turn returned no candidates, never say you found restaurants and never name a restaurant: state plainly which requirement has no catalog match, using diagnostic.summary as the source of truth, and offer the concrete options it lists in one question. If the user then defers ("whatever", "you pick", "sounds good", or any equivalent) or has already been asked about this conflict, do not ask again: relax the blocking soft preference (cuisine, price, or atmosphere wording) yourself, search again in the same city, and recommend; tell them what you relaxed. City and dietary needs stay hard unless the user explicitly changes them. Any restaurant your reply names must be a tool-returned ID given as recommendation_id or in alternatives. When the user asks to see again a restaurant recommended earlier in the conversation, set recommendation_id to that restaurantId. When they simply choose one of the restaurants you just showed, confirm briefly and set recommendation_id to null; the card is already on screen. Never offer reservations or other actions you cannot perform. Never invent ratings, exact prices, availability, or dietary safety. Never relax a hard requirement without asking. If an empty search result has diagnostic.city_result_count 0, say you cannot confidently recommend a restaurant in that city, offer diagnostic.available_cities, and only search another city if the user explicitly names or accepts it. Never mention databases, tools, errors, outages, or system access to the user. If a search result has status "fallback", recommend from its candidates normally. A tool result with status "invalid_arguments" lists problems: fix them and call again. A tool result with status "budget_exhausted" means answer now with what you already have. If no candidate data is available, say warmly that you are having trouble narrowing the list right now and ask one helpful preference question; never fabricate a restaurant. After tool use, return ONLY JSON: {"reply":"...","recommendation_id":number|null,"why":"...","caveat":"...","alternatives":[{"id":number,"why":"...","caveat":"..."}]}. recommendation_id must be an ID returned by a tool. why and caveat describe only that primary restaurant. When your reply suggests more than one restaurant, list at most two additional restaurants (each an ID returned by a tool) in alternatives with its own why and caveat; otherwise use an empty array.` },
     { role: 'system', content: `Personalization rule: saved preferences are context, not an automatic decision. Treat hard requirements such as dietary restrictions as constraints; treat prior cuisines, cities, and restaurants as soft signals that may inform a question or tie-break only after the user states what they want for this outing. Never recommend a restaurant solely because it matches a remembered preference, and do not repeatedly steer the user toward a remembered cuisine or place. This is ${isOpeningTurn ? 'the opening user turn of a new conversation' : 'an ongoing conversation'}. On an opening turn without a concrete dining request, ask one broad, open-ended question about what they feel like eating; do not search or recommend. A concrete request includes a cuisine, dish, meal type, occasion, location, budget, dietary need, or direct request for a recommendation, including asking you to choose for them. Use the user’s new message and current-outing context as the primary signal; only mention a saved preference when it directly helps resolve an ambiguity.` },
-    { role: 'system', content: `Delegation: when the user hands the choice to you ("surprise me", "pick for me", "you decide", "anything", or any equivalent), cuisine, price, and atmosphere are open; never ask about them. The city is the only thing you may still ask for. Once a city is confirmed in this conversation, search it using only hard requirements already in context (dietary needs such as vegan or gluten-free, passed as keyword) and recommend one restaurant plus alternatives. Location: always store city in tonight, never in saved. People eat in different cities from day to day, so a city counts only once the user says they are eating there for this outing, or confirms it. Where they live, work, or are based is background, not tonight's location: ask "Eating in <that city> tonight?" before storing or searching it. ${previousCity ? `Their last-used city was ${previousCity}. Whenever you ask for a location, your question MUST name it as a quick confirmation, for example "Still eating in ${previousCity}, or somewhere else?"; never store or search it until they confirm.` : ''}` },
+    { role: 'system', content: `Delegation: when the user hands the choice to you ("surprise me", "pick for me", "you decide", "anything", or any equivalent), cuisine, price, and atmosphere are open; never ask about them. The city is the only thing you may still ask for. Once a city is confirmed in this conversation, search it using only hard requirements already in context (dietary needs such as vegan or gluten-free, passed as keyword) and recommend one restaurant plus alternatives. Location: always store city in tonight, never in saved. People eat in different cities from day to day, so a city counts only once the user says they are eating there for this outing, or confirms it. Where they live, work, or are based is background, not tonight's location: ask "Eating in <that city> tonight?" before storing or searching it. If the user says they will go anywhere ("I'll drive anywhere", "any city", "wherever"), that answers the location question: never ask for a city again. The server records the city as "Anywhere" (possibly "Anywhere except <cities they ruled out>"); search right away and recommend. Results may come from any catalog city, so name each suggested restaurant's city in the reply. ${previousCity ? `Their last-used city was ${previousCity}. Whenever you ask for a location, your question MUST name it as a quick confirmation, for example "Still eating in ${previousCity}, or somewhere else?"; never store or search it until they confirm.` : ''}` },
     { role: 'system', content: 'Non-negotiable location wording: this catalog only has city names, not coordinates. Never describe a different city as nearby, closest, local to, within a radius, or a short drive. When coverage is missing, say only that the catalog includes records in named other cities.' },
     { role: 'system', content: `Outings: when the user signals a new outing (they are back, it is a different meal or time, or they are with different people), the previous tonight plans no longer apply. In that turn's update_context, remove the old tonight fields (city, companions, group, occasion, time, budget, and any diet that belonged to a companion), then confirm the city again before searching; do not assume the old city. A companion's dietary need ("my girlfriend is vegan") is a tonight diet, never saved. Record who they are with in companions. If the user names a city and leaves the rest open ("anything around here", "whatever's good"), that is delegation: search and recommend in that turn without asking about cuisine or vibe. Hours: ${userTime ? `the user's local time is ${userTime} (for reasoning only; store time in context only when the user states one). ` : ''}When the user mentions a meal, a time, or "now", read each candidate's hours_text and prefer places open then; never recommend a place listed as closed at that time without saying so in the caveat. Also prefer places whose listed context fits the stated group and occasion.` },
     { role: 'user', content: `Current context: ${JSON.stringify(current)}\nRecent conversation: ${JSON.stringify(recentHistory)}\nUser message: ${message.trim()}` }
@@ -460,7 +493,8 @@ export async function chat({ message, context = [], history = [], locationPrompt
 
   // --- Normalize the request ---
   let current = normalizeContext(context)
-  const previousCity = typeof lastCity === 'string' ? lastCity.trim().slice(0, 80) : ''
+  // An open location ("Anywhere") is not a city to offer back as "Still eating in …?".
+  const previousCity = typeof lastCity === 'string' && !openLocation(lastCity) ? lastCity.trim().slice(0, 80) : ''
   const userTime = typeof localTime === 'string' ? localTime.trim().slice(0, 60) : ''
   // events: activity log returned to the UI. records: every restaurant a tool returned this turn,
   // which is the allowlist for what the final answer may recommend.
@@ -601,6 +635,21 @@ export async function chat({ message, context = [], history = [], locationPrompt
           // The previous reply only counts as offering a city when it asked a question.
           const previousReply = lastAssistant?.text || ''
           const lastQuestion = previousReply.includes('?') ? previousReply : ''
+          // Open location: when the user says "anywhere" without naming a city to eat in, record city as "Anywhere",
+          // carrying over cities ruled out earlier and adding any ruled out now. Done here, not left to the model,
+          // because asking for a city again after "anywhere" is the loop this prevents.
+          const cityEntry = Object.entries(args.set || {}).find(([field]) => contextKey(field) === 'city')
+          if (OPEN_LOCATION.test(message) || (cityEntry && OPEN_LOCATION.test(String(cityEntry[1])))) {
+            const cities = await catalogCities()
+            const ruledOut = ruledOutCities(message, cities)
+            const namesCity = cities.some(city => !ruledOut.includes(city) && looselyMentions(message, city))
+            const setsRealCity = cityEntry && !OPEN_LOCATION.test(String(cityEntry[1])) && !ruledOut.some(city => city.toLowerCase() === String(cityEntry[1]).trim().toLowerCase())
+            if (!namesCity && !setsRealCity) {
+              const earlier = openLocation(current.find(item => item.kind === 'tonight' && item.key === 'city')?.value)?.except || []
+              const except = [...new Map([...earlier, ...ruledOut].map(city => [city.toLowerCase(), city])).values()]
+              args.set = { ...Object.fromEntries(Object.entries(args.set || {}).filter(([field]) => contextKey(field) !== 'city')), city: openLocationValue(except) }
+            }
+          }
           const unconfirmed = unconfirmedLocations(args.set, message, lastQuestion)
           if (unconfirmed.length) args.set = Object.fromEntries(Object.entries(args.set).filter(([field]) => !unconfirmed.includes(field)))
           // A tonight value that merely repeats a saved preference the user did not mention this turn is not a new plan;
@@ -625,9 +674,10 @@ export async function chat({ message, context = [], history = [], locationPrompt
           // The context city always wins over whatever city the model passed.
           args.city = city
           // Only earlier recommendations may be excluded; excluding a restaurant from another city is a no-op, so drop it to keep the trace honest.
+          // An open location spans every city, so nothing is dropped there.
           const excluded = (Array.isArray(args.exclude_restaurant_ids) ? args.exclude_restaurant_ids : [])
             .filter(id => Number.isInteger(id) && priorRecommendationIds.has(id))
-            .filter(id => !recentCatalog.get(id) || recentCatalog.get(id).city.toLowerCase() === city.toLowerCase())
+            .filter(id => openLocation(city) || !recentCatalog.get(id) || recentCatalog.get(id).city.toLowerCase() === city.toLowerCase())
           args.exclude_restaurant_ids = excluded
           // The same term in both filters (e.g. "vegan") would require it in the cuisine label too; keep it only as a keyword.
           if (typeof args.cuisine === 'string' && typeof args.keyword === 'string' && args.cuisine.trim().toLowerCase() === args.keyword.trim().toLowerCase()) args.cuisine = ''
@@ -637,13 +687,13 @@ export async function chat({ message, context = [], history = [], locationPrompt
           const tonightCuisine = current.find(item => item.kind === 'tonight' && item.key === 'cuisine')?.value
           if (typeof args.cuisine === 'string' && args.cuisine.trim() && savedCuisine && !tonightCuisine && looselyMentions(savedCuisine, args.cuisine) && !looselyMentions(message, args.cuisine)) args.cuisine = ''
           const filters = { min_price_level: args.min_price_level, max_price_level: args.max_price_level, cuisine: args.cuisine, keyword: args.keyword, excluded }
-          const { data, error } = await applyFilters(db.from('restaurants').select(select).limit(SEARCH_LIMIT).ilike('city', city), filters)
+          const { data, error } = await applyFilters(inLocation(db.from('restaurants').select(select).limit(SEARCH_LIMIT), city), filters)
           if (error) throw error
           // Exclusions only make sense when other options exist. If excluding earlier picks empties the search,
           // re-run without them: those earlier picks are the honest answer, marked as already shown.
           let rows = data, previouslyShown = false
           if (!rows?.length && excluded.length) {
-            const retry = await applyFilters(db.from('restaurants').select(select).limit(SEARCH_LIMIT).ilike('city', city), { ...filters, excluded: [] })
+            const retry = await applyFilters(inLocation(db.from('restaurants').select(select).limit(SEARCH_LIMIT), city), { ...filters, excluded: [] })
             if (retry.error) throw retry.error
             if (retry.data?.length) { rows = retry.data; previouslyShown = true }
           }

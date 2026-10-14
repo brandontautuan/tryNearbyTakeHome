@@ -117,9 +117,9 @@ export default function App() {
       setMessages(m => [...m, { id: crypto.randomUUID(), role: 'assistant', text: response.reply, recommendation: response.recommendation, alternatives: response.alternatives, noMatches: response.noMatches }])
       // The server returns the full updated context; it replaces ours.
       setContext(response.context)
-      // Remember the confirmed city so the next outing can offer "Still eating in …?".
+      // Remember the confirmed city so the next outing can offer "Still eating in …?". "Anywhere" is not a city to offer back.
       const confirmedCity = response.context.find(detail => detail.key === 'city')?.value
-      if (confirmedCity) localStorage.setItem('nearby-last-city', confirmedCity)
+      if (confirmedCity && !/^anywhere\b/i.test(confirmedCity)) localStorage.setItem('nearby-last-city', confirmedCity)
       // Newest first.
       setActivity(a => [...[...response.activity].reverse(), ...a])
       // Location prompt counter: reset once a city is known, count each unanswered ask, stop at 3.
